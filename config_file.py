@@ -11,14 +11,15 @@ class Config(object):
 
     # Hyper-parameters for the training data loader
     heat_map_size = 64
-    sigma = 2
+    kernel_size = 7
+    sigma = 1
     input_size = 256
-    num_epochs = 10
-    batch_size = 32
+    num_epochs = 5
+    batch_size = 8
     is_shuffle = False
 
     # Parameters for the HourGlass-based heat map generator
-    stack = 4
+    stack = 2
     depth = 4
     in_channels = 3
     last_channels = 21
@@ -30,8 +31,11 @@ class Config(object):
     # Adam
     lr = 1e-3
     weight_decay = 1e-5
-    step_size = 4
+    step_size = 3
     gamma = 0.1
+
+    # for loss functions
+    temperature = 10.0
 
 config = Config()
 

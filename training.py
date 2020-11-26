@@ -8,11 +8,12 @@ import cv2
 import numpy as np
 import pickle
 import torch
-from torch.autograd import Variable
 from torchvision import transforms
-from torchvision.transforms import functional as TF
+import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
-
+import kornia
+from kornia.geometry import spatial_soft_argmax2d
+from kornia.geometry.subpix import dsnt
 from HGFilters import HGFilter
 from net_util import conv3x3
 from config_file import config
@@ -22,6 +23,7 @@ toPIL = transforms.ToPILImage()
 toTensor = transforms.ToTensor()
 recorder = metrics.MetricsRecorder()
 device = metrics.device
+
 
 class hm_dataset(Dataset):
     def __init__(self, root_dir, mode, input_resize=256, hm_size=64):
@@ -98,42 +100,63 @@ class hm_dataset(Dataset):
         one_hand_kp_y_for_cropping = scale_factor * (one_hand_kp_y - top_left_corner[1])
 
         # create heat map ground truth from key points
+
+        # method 1: abandoned ↓
         # 1. create a Gaussian probability distribution
-        sigma = config.sigma  # Gaussian blur kernel size
-        patch = np.zeros(shape=[6 * sigma + 1, 6 * sigma + 1],
-                         dtype=np.float)
-        patch[3 * sigma, 3 * sigma] = 255
-        patch = cv2.GaussianBlur(patch, ksize=(0, 0), sigmaX=sigma, sigmaY=sigma)
+        # sigma = config.sigma  # Gaussian blur kernel size
+        #
+        # patch = np.zeros(shape=[6 * sigma + 1, 6 * sigma + 1],
+        #                  dtype=np.float)
+        # patch[3 * sigma, 3 * sigma] = 255
+        # patch = cv2.GaussianBlur(patch, ksize=(0, 0), sigmaX=sigma, sigmaY=sigma)
 
         # 2. generate a heat map for each visible key point
         # For ground truth generation of the score maps, we use normal distributions with a standard deviation of 2 pixels and
         # the mean being equal to the given key point location. We normalize the resulting maps such that
         # each map contains values from 0 to 1, if there is a keypoint visible.
         # For invisible keypoints the map is zero everywhere.
+        # hm_lst = []
+        #
+        # for kp_idx in range(21):
+        #     if one_hand_visible_kps[kp_idx]:
+        #         hm = np.zeros((hm_size, hm_size), dtype=np.float)
+        #
+        #         col = int(one_hand_kp_x_for_cropping[kp_idx])
+        #         row = int(one_hand_kp_y_for_cropping[kp_idx])
+        #
+        #         # add the patch onto the black background to get a heat map
+        #         row_idx, col_idx = 0, 0
+        #         for i in range(0, 6 * sigma + 1):
+        #             row_idx = row - 3 * sigma + i
+        #             if 0 <= row_idx < hm_size:
+        #                 for j in range(0, 6 * sigma + 1):
+        #                     col_idx = col - 3 * sigma + j
+        #                     if 0 <= col_idx < hm_size:
+        #                         hm[row_idx, col_idx] = patch[i, j]
+        #         normalized_hm = hm / hm.sum(0).sum(0)
+        #
+        #     else:
+        #         normalized_hm = np.zeros((self.hm_size, self.hm_size), dtype=np.float)
+        #     hm_lst.append(normalized_hm)
+        # abandoned ↑
+
+        gaussian_blur_kernel = kornia.filters.GaussianBlur2d((config.kernel_size, config.kernel_size),
+                                                             (config.sigma, config.sigma),
+                                                             border_type='constant')
         hm_lst = []
 
         for kp_idx in range(21):
             if one_hand_visible_kps[kp_idx]:
-                hm = np.zeros((hm_size, hm_size), dtype=np.float)
+                hm = torch.zeros((1,1,hm_size, hm_size))
 
                 col = int(one_hand_kp_x_for_cropping[kp_idx])
                 row = int(one_hand_kp_y_for_cropping[kp_idx])
 
-                # add the patch onto the black background to get a heat map
-                row_idx, col_idx = 0, 0
-                for i in range(0, 6 * sigma + 1):
-                    row_idx = row - 3 * sigma + i
-                    if 0 <= row_idx < hm_size:
-                        for j in range(0, 6 * sigma + 1):
-                            col_idx = col - 3 * sigma + j
-                            if 0 <= col_idx < hm_size:
-                                hm[row_idx, col_idx] = patch[i, j]
-                normalized_hm = hm / hm.sum(0).sum(0)
-
+                hm[0][0][row][col] = 1
+                normalized_hm = gaussian_blur_kernel(hm).squeeze()
             else:
-                normalized_hm = np.zeros((self.hm_size, self.hm_size), dtype=np.float)
+                normalized_hm = torch.zeros((self.hm_size, self.hm_size))
             hm_lst.append(normalized_hm)
-
         # print("l:{} r:{} b:{} t:{} size:{}".format(leftmost, rightmost, bottommost, topmost, crop_size))
         # print("top_left corner:", top_left_corner)
         # print("crop size:", cropped_img.size)
@@ -154,18 +177,16 @@ class hm_dataset(Dataset):
         #     cropped_img_tensor = cropped_img.resize((self.hm_size, self.hm_size))
         #     ax2.imshow(cropped_img_tensor)
         #     ax2.plot(one_hand_kp_x_for_cropping[i], one_hand_kp_y_for_cropping[i], 'r*')
-        #
-        #     heat_map_uint8 = (255 * hm_lst[i]).astype('uint8')
-        #     heat_map_RGB = toTensor(heat_map_uint8)  # [3, W, H]
-        #     ax3.imshow(toPIL(heat_map_RGB))
-        #
+        #     print()
+        #     ax3.imshow(toPIL(255 * hm_lst[i]))
         #     plt.show()
+
 
         transform_for_img = transforms.Compose([transforms.Resize((self.input_resize, self.input_resize)),
                                                 transforms.ToTensor()
                                                 ])
         one_sample = {'image': transform_for_img(cropped_img),  ## type: torch.Tensor
-                      'heat_map_gn': np.stack(hm_lst, axis=0),  ## type: np.array size: [21,w,h]
+                      'heat_map_gn': torch.stack(hm_lst),  ## type: torch.tensor size: [21,w,h]
                       '2d_kp_anno': np.vstack((one_hand_kp_x_for_cropping, one_hand_kp_y_for_cropping)).transpose()
                       ## type: np.array size: 21 x 2
                       }
@@ -191,6 +212,7 @@ def visualize_samples(data_loader):
             ax1.imshow(img)
             ax2.imshow(toPIL(batch['heat_map_gn'][0][i]))
             print(torch.max(batch['heat_map_gn'][0][i]))
+            print(batch['heat_map_gn'][0][i])
             plt.show()
 
 
@@ -203,7 +225,7 @@ def evaluate(val_data_loader, model):
             hm_groundtruth = batch['heat_map_gn'].to(device)
             output = model(input_img)
             kps_gn = batch['2d_kp_anno'].to(device)
-            recorder.process_validation_output(hm_pred=output[0][-1],
+            recorder.process_validation_output(hm_pred=output[0],
                                                hm_gn=hm_groundtruth,
                                                kps_gn=kps_gn)
             del input_img
@@ -212,24 +234,24 @@ def evaluate(val_data_loader, model):
     return recorder.finish_eval()
 
 
-def save_checkpoint(state: dict, is_best_HM_loss, is_best_EPE, is_best_PCK):
+def save_checkpoint(state: dict, is_best_HM_loss, is_best_pose2d_loss, is_best_total_loss):
     hm_loss_str = "{:.4f}".format(recorder.val_hm_loss[-1])
-    EPE_str = "{:.4f}".format(recorder.val_avg_EPE[-1])
-    PCK_str = "{:.4f}".format(recorder.val_avg_PCK[-1])
+    kps_loss_str = "{:.4f}".format(recorder.val_kps_loss[-1])
+    total_loss_str = "{:.4f}".format(recorder.val_total_loss[-1])
 
     filename = os.path.join(config.ckpt_dir,
-                            config.model_name + "-ckpt_HM_Loss_" + hm_loss_str + "_EPE_" + EPE_str + "_PCK_" + PCK_str + ".pth.tar")
+                            config.model_name + "-ckpt_HMLoss_" + hm_loss_str + "_PoseLoss_" + kps_loss_str + "_TotalLOss_" + total_loss_str + ".pth.tar")
     torch.save(state, filename)
     if is_best_HM_loss:
         print("This model has been saved for its lower heat map loss: ", hm_loss_str)
         torch.save(state, os.path.join(config.ckpt_dir, config.model_name + "-ckpt_LowestHMLoss.pth.tar"))
 
-    if is_best_PCK:
-        print("This model has been saved for its higher PCK:", PCK_str)
-        torch.save(state, os.path.join(config.ckpt_dir, config.model_name + "-ckpt_HighestPCK.pth.tar"))
+    if is_best_total_loss:
+        print("This model has been saved for its lower total loss:", total_loss_str)
+        torch.save(state, os.path.join(config.ckpt_dir, config.model_name + "-ckpt_LowestTotalLoss.pth.tar"))
 
-    if is_best_EPE:
-        print("This model has been saved for its lower EPE: ", EPE_str)
+    if is_best_pose2d_loss:
+        print("This model has been saved for its lower 2D pose loss: ", kps_loss_str)
         torch.save(state, os.path.join(config.ckpt_dir, config.model_name + "-ckpt_Lowest2DPoseError.pth.tar"))
 
 
@@ -246,20 +268,20 @@ def main():
     print("Reading dataset...")
     training_set = hm_dataset(config.root_dir, 'training', input_resize=config.input_size)
     val_set = hm_dataset(config.root_dir, 'evaluation', input_resize=config.input_size)
-    train_loader = torch.utils.data.DataLoader(
+    train_loader = DataLoader(
         training_set,
         batch_size=config.batch_size,  # 每批样本个数
         shuffle=config.is_shuffle,  # 是否打乱顺序
         drop_last=True
     )
-    val_loader = torch.utils.data.DataLoader(
+    val_loader = DataLoader(
         val_set,
         batch_size=config.batch_size,  # 每批样本个数
         shuffle=config.is_shuffle,  # 是否打乱顺序
     )
     config.num_train_samples = len(training_set)
     config.num_val_samples = len(val_set)
-    config.num_iters = int(len(training_set)/config.batch_size)
+    config.num_iters = int(len(training_set) / config.batch_size)
     print("Found {} training samples and {} validation samples".format(len(training_set), len(val_set)))
 
     # instantiate a model
@@ -271,7 +293,7 @@ def main():
     if model is None:
         print("The model created is invalid! Program terminated!")
         exit()
-    #recorder.writer.add_graph(model)
+    # recorder.writer.add_graph(model)
     model.to(device)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
@@ -281,9 +303,10 @@ def main():
     if resume:
         ckpt = torch.load(os.path.join(config.ckpt_dir, config.model_name + "-ckpt_Lowest2DPoseError.pth.tar"))
         start_epoch = ckpt['epoch']
-        recorder.val_hm_loss_min = ckpt["valid_hm_loss"]
-        recorder.val_EPE_min = ckpt["EPE"]
-        recorder.val_PCK_max = ckpt["PCK"]
+        recorder.val_hm_loss_min = ckpt["val_hm_loss_min"]
+        recorder.val_kps_loss_min = ckpt["val_kps_loss_min"]
+        recorder.val_total_loss_min = ckpt["val_total_loss_min"]
+        recorder.val_PCK_max = ckpt["val_PCK_max"]
         model.load_state_dict(ckpt["state_dict"])
         optimizer.load_state_dict(ckpt["optimizer"])
         lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=config.step_size, gamma=config.gamma,
@@ -300,11 +323,12 @@ def main():
 
     print("-------------------------Training starts--------------------------")
     for epoch in range(start_epoch, config.num_epochs):
-        epoch_str = "Epoch %d" % (epoch+1)
+        epoch_str = "Epoch %d" % (epoch + 1)
         print(epoch_str, "Learning rate: %f   Time: " % (optimizer.param_groups[0]['lr']), end='')
         print(time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()))
         start_time = time.time()
         for i, batch in enumerate(train_loader):
+            break
             # batch has three keys:
             #     # key 1: batch['image']         size: B x 3(C) x 192(W) x 192(H)
             #     # key 2: batch['heat_map_gn']   size: B x 21(kps) x 64(W) x 64(H)
@@ -314,11 +338,11 @@ def main():
 
             model.train()
             input_img = batch['image'].to(device)
-            hm_groundtruth = batch['heat_map_gn'].to(device)
+            hm_groundtruth = batch['heat_map_gn'].to(device).float()
             # the output has two items. 1. tmp_outputs: contains outputs from each stage
             # 2. norm_x
             output = model(input_img)
-            loss = recorder.process_training_output(hm_pred=output[0][-1],
+            loss = recorder.process_training_output(hm_pred=output[0],
                                                     hm_gn=hm_groundtruth,
                                                     kps_gn=batch['2d_kp_anno'])
 
@@ -331,25 +355,35 @@ def main():
             del loss
 
         print("Evaluating model...")
-        is_best_HM_loss, is_best_EPE, is_best_PCK = evaluate(val_loader, model)
-        print(epoch_str, "heat map loss: {:.4f} (The best: {:.4f})".format(recorder.val_hm_loss[-1], recorder.val_hm_loss_min))
-        print(epoch_str, "2D pose loss: {:.4f} (The best: {:.4f})".format(recorder.val_avg_EPE[-1], recorder.val_EPE_min))
-        print(epoch_str, "PCK: {:.4f} (The best: {:.4f})".format(recorder.val_avg_PCK[-1], recorder.val_PCK_max))
+        is_best_HM_loss, is_best_pose2d_loss, is_best_total_loss = evaluate(val_loader, model)
+        print(epoch_str,
+              "heat map loss: {:.4f} (The best: {:.4f})".format(recorder.val_hm_loss[-1], recorder.val_hm_loss_min))
+        print(epoch_str,
+              "2D pose loss: {:.4f} (The best: {:.4f})".format(recorder.val_kps_loss[-1], recorder.val_kps_loss_min))
+        print(epoch_str,
+              "Total loss: {:.4f} (The best: {:.4f})".format(recorder.val_total_loss[-1], recorder.val_total_loss_min))
+        print(epoch_str,
+              "PCK: {:.4f} (The best: {:.4f})".format(recorder.val_avg_PCK[-1], recorder.val_PCK_max))
 
         print("Saving model checkpoint...")
         save_checkpoint({
             "epoch": epoch + 1,
             "model_name": config.model_name,
             "state_dict": model.state_dict(),
-            "EPE": recorder.val_avg_EPE[-1],
-            "PCK": recorder.val_avg_PCK[-1],
             "optimizer": optimizer.state_dict(),
-            "valid_hm_loss": recorder.val_hm_loss[-1],
-        }, is_best_HM_loss, is_best_EPE, is_best_PCK)
+            "val_pose2d_loss": recorder.val_kps_loss[-1],
+            "val_hm_loss": recorder.val_hm_loss[-1],
+            "val_total_loss": recorder.val_total_loss[-1],
+            "PCK": recorder.val_avg_PCK[-1],
+            "val_hm_loss_min": recorder.val_hm_loss_min,
+            "val_kps_loss_min": recorder.val_kps_loss_min,
+            "val_total_loss_min": recorder.val_total_loss_min,
+            "val_PCK_max": recorder.val_PCK_max
+        }, is_best_HM_loss, is_best_pose2d_loss, is_best_total_loss)
 
         lr_scheduler.step()
 
-        print("Epoch %d spent %d seconds \n" % (epoch+1, int(time.time()-start_time)))
+        print("Epoch %d spent %d seconds \n" % (epoch + 1, int(time.time() - start_time)))
 
     recorder.close()
 
@@ -372,6 +406,40 @@ def test():
 
         print("第%d个epoch的学习率：%f" % (epoch, optimizer_1.param_groups[0]['lr']))
         scheduler_1.step()
+
+
+def test_hm_loss_fn():
+    training_set = hm_dataset(config.root_dir, 'training', input_resize=config.input_size)
+    train_loader = torch.utils.data.DataLoader(
+        training_set,
+        batch_size=config.batch_size,  # 每批样本个数
+        shuffle=config.is_shuffle,  # 是否打乱顺序
+        drop_last=True
+    )
+    for i, batch in enumerate(train_loader):
+        hm_gn = batch['heat_map_gn']
+        kps_gn = batch['2d_kp_anno']
+        kps_pred = dsnt.spatial_expectation2d(hm_gn, normalized_coordinates=False)
+        #kps_pred = spatial_soft_argmax2d(hm_gn, temperature=torch.tensor(10),normalized_coordinates=False)
+        print('kps_pred',kps_pred[0][0:5])
+        print('kp_pos',kps_gn[0][0:5])
+        print(recorder.pose2d_loss_fn(kps_gn,kps_pred))
+        input()
+
+    x=torch.zeros((1,3,7,7))
+    x[0][0][1][6]=1
+    gaussian_blur_kernel = kornia.filters.GaussianBlur2d((7,7),(1,1),border_type='constant')
+    y=gaussian_blur_kernel(x)
+    for i in range(y.size(1)):
+        if y[0][i].sum().item() >0:
+            y[0][i] /= y[0][i].sum()
+
+    output: torch.Tensor = dsnt.spatial_expectation2d(y, normalized_coordinates=False)
+    print('kps_pred', output[0])
+    #print('kp_pos',kps_gn[0][0:5])
+
+
+
 
 
 if __name__ == '__main__':
