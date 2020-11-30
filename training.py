@@ -1,12 +1,12 @@
 import os
 import shutil
 import time
+import logging
 
 from PIL import Image
 import matplotlib.pyplot as plt
 import cv2
 import numpy as np
-import pickle
 import torch
 from torchvision import transforms
 import torch.nn.functional as F
@@ -14,206 +14,15 @@ from torch.utils.data import Dataset, DataLoader
 import kornia
 from kornia.geometry import spatial_soft_argmax2d
 from kornia.geometry.subpix import dsnt
+
 from HGFilters import HGFilter
-from net_util import conv3x3
 from config_file import config
 import metrics
+from dataset_utils import hm_dataset
 
-toPIL = transforms.ToPILImage()
-toTensor = transforms.ToTensor()
 recorder = metrics.MetricsRecorder()
 device = metrics.device
 
-
-class hm_dataset(Dataset):
-    def __init__(self, root_dir, mode, input_resize=256, hm_size=64):
-        r"""Read RGB images and their ground truth heat maps
-        params:
-        @ root_dir: the directory where the training and test datasets are located
-        @ mode: indicates whether the this is a training set ot a test set
-        @ transform: data augmentation is implemented if transformers are given
-        """
-
-        self.root_dir = root_dir
-        self.data_path = os.path.join(root_dir, mode, 'color')
-        self.images = os.listdir(self.data_path)
-        self.hm_size = hm_size
-        self.input_resize = input_resize
-        self.anno2d_path = os.path.join(root_dir, mode, 'anno_%s.pickle' % mode)
-        with open(self.anno2d_path, 'rb') as fi:
-            self.anno_all = pickle.load(fi)
-
-    def __len__(self):
-        return len(self.images)
-
-    def __getitem__(self, index):
-        hm_size = self.hm_size
-        # read an image
-        img_name = self.images[index]
-        img_path = os.path.join(self.data_path, img_name)
-        img = Image.open(img_path)
-
-        # read the 2D keypoints annotation of this image. Note: "self.anno_all[index]['uv_vis']"" is a numpy array of size 42x3.
-        # The first colum of 2D kp annotation matrix represents the x-axis (horizontal and positive rightwards) value of a key point;
-        # the second column represents the y-axis (vertical and positive upwards) value of a key point;
-        # the third column consists boolean values donoting the visibility of key points (1 for visible points and 0 otherwise)
-        kp_coord_uv = self.anno_all[index]['uv_vis'][:, :2]  # u, v coordinates of 42 hand key points, pixel
-        kp_visible = (self.anno_all[index]['uv_vis'][:, 2] == 1)  # visibility of the key points, boolean
-
-        num_left_hand_visible_kps = np.sum(self.anno_all[index]['uv_vis'][0:21, 2])
-        num_right_hand_visible_kps = np.sum(self.anno_all[index]['uv_vis'][21:42, 2])
-
-        # crop the image so that it contains only one hand which has the most visible key points
-        if num_left_hand_visible_kps > num_right_hand_visible_kps:
-            one_hand_kp_x = kp_coord_uv[0:21, 0].copy()
-            one_hand_kp_y = kp_coord_uv[0:21, 1].copy()
-            one_hand_visible_kps = kp_visible[0:21]
-        else:
-            one_hand_kp_x = kp_coord_uv[21:42, 0].copy()
-            one_hand_kp_y = kp_coord_uv[21:42, 1].copy()
-            one_hand_visible_kps = kp_visible[21:42]
-
-        leftmost, rightmost = np.min(one_hand_kp_x), np.max(one_hand_kp_x)
-        bottommost, topmost = np.max(one_hand_kp_y), np.min(one_hand_kp_y)
-        w, h = rightmost - leftmost, bottommost - topmost
-
-        crop_size = min(img.size[0], int(2 * w if w > h else 2 * h))
-
-        # top_left_corner of the cropped area: [u, v] in u-v image system ↓→
-        top_left_corner = (max(0, min(int(leftmost - (crop_size - w) / 2), img.size[0] - crop_size)),
-                           max(0, min(img.size[1] - crop_size, int(topmost - (crop_size - h) / 2))))
-
-        cropped_img = img.crop(  # a PIL image
-            (
-                top_left_corner[0],  # The distance of the left border to the left border of the original image
-                top_left_corner[1],  # The distance of the top border to the top border of the original image
-                top_left_corner[0] + crop_size,
-                # The distance of the right border to the left border of the original image
-                top_left_corner[1] + crop_size
-                # The distance of the bottom border to the top border of the original image
-            )
-        )
-
-        # calculate the ground truth positions of key points on heat maps
-        scale_factor = hm_size / crop_size
-        one_hand_kp_x_for_cropping = scale_factor * (one_hand_kp_x - top_left_corner[0])
-        one_hand_kp_y_for_cropping = scale_factor * (one_hand_kp_y - top_left_corner[1])
-
-        # create heat map ground truth from key points
-
-        # method 1: abandoned ↓
-        # 1. create a Gaussian probability distribution
-        # sigma = config.sigma  # Gaussian blur kernel size
-        #
-        # patch = np.zeros(shape=[6 * sigma + 1, 6 * sigma + 1],
-        #                  dtype=np.float)
-        # patch[3 * sigma, 3 * sigma] = 255
-        # patch = cv2.GaussianBlur(patch, ksize=(0, 0), sigmaX=sigma, sigmaY=sigma)
-
-        # 2. generate a heat map for each visible key point
-        # For ground truth generation of the score maps, we use normal distributions with a standard deviation of 2 pixels and
-        # the mean being equal to the given key point location. We normalize the resulting maps such that
-        # each map contains values from 0 to 1, if there is a keypoint visible.
-        # For invisible keypoints the map is zero everywhere.
-        # hm_lst = []
-        #
-        # for kp_idx in range(21):
-        #     if one_hand_visible_kps[kp_idx]:
-        #         hm = np.zeros((hm_size, hm_size), dtype=np.float)
-        #
-        #         col = int(one_hand_kp_x_for_cropping[kp_idx])
-        #         row = int(one_hand_kp_y_for_cropping[kp_idx])
-        #
-        #         # add the patch onto the black background to get a heat map
-        #         row_idx, col_idx = 0, 0
-        #         for i in range(0, 6 * sigma + 1):
-        #             row_idx = row - 3 * sigma + i
-        #             if 0 <= row_idx < hm_size:
-        #                 for j in range(0, 6 * sigma + 1):
-        #                     col_idx = col - 3 * sigma + j
-        #                     if 0 <= col_idx < hm_size:
-        #                         hm[row_idx, col_idx] = patch[i, j]
-        #         normalized_hm = hm / hm.sum(0).sum(0)
-        #
-        #     else:
-        #         normalized_hm = np.zeros((self.hm_size, self.hm_size), dtype=np.float)
-        #     hm_lst.append(normalized_hm)
-        # abandoned ↑
-
-        gaussian_blur_kernel = kornia.filters.GaussianBlur2d((config.kernel_size, config.kernel_size),
-                                                             (config.sigma, config.sigma),
-                                                             border_type='constant')
-        hm_lst = []
-
-        for kp_idx in range(21):
-            if one_hand_visible_kps[kp_idx]:
-                hm = torch.zeros((1,1,hm_size, hm_size))
-
-                col = int(one_hand_kp_x_for_cropping[kp_idx])
-                row = int(one_hand_kp_y_for_cropping[kp_idx])
-
-                hm[0][0][row][col] = 1
-                normalized_hm = gaussian_blur_kernel(hm).squeeze()
-            else:
-                normalized_hm = torch.zeros((self.hm_size, self.hm_size))
-            hm_lst.append(normalized_hm)
-        # print("l:{} r:{} b:{} t:{} size:{}".format(leftmost, rightmost, bottommost, topmost, crop_size))
-        # print("top_left corner:", top_left_corner)
-        # print("crop size:", cropped_img.size)
-
-        # cropped_img_tensor = toTensor(cropped_img)  # [3, W, H]
-        #
-        # for i in range(0,21,5):
-        #     fig = plt.figure(1)
-        #     ax1 = fig.add_subplot('131')
-        #     ax2 = fig.add_subplot('132')
-        #     ax3 = fig.add_subplot('133')
-        #
-        #     ax1.imshow(img)  # the original image
-        #     ax1.plot(one_hand_kp_x[i], one_hand_kp_y[i], 'r*')
-        #     ax1.plot([top_left_corner[0], top_left_corner[0] + crop_size],
-        #              [top_left_corner[1], top_left_corner[1] + crop_size], 'r')  # the cropped area
-        #
-        #     cropped_img_tensor = cropped_img.resize((self.hm_size, self.hm_size))
-        #     ax2.imshow(cropped_img_tensor)
-        #     ax2.plot(one_hand_kp_x_for_cropping[i], one_hand_kp_y_for_cropping[i], 'r*')
-        #     print()
-        #     ax3.imshow(toPIL(255 * hm_lst[i]))
-        #     plt.show()
-
-
-        transform_for_img = transforms.Compose([transforms.Resize((self.input_resize, self.input_resize)),
-                                                transforms.ToTensor()
-                                                ])
-        one_sample = {'image': transform_for_img(cropped_img),  ## type: torch.Tensor
-                      'heat_map_gn': torch.stack(hm_lst),  ## type: torch.tensor size: [21,w,h]
-                      '2d_kp_anno': np.vstack((one_hand_kp_x_for_cropping, one_hand_kp_y_for_cropping)).transpose()
-                      ## type: np.array size: 21 x 2
-                      }
-
-        return one_sample
-
-
-def visualize_samples(data_loader):
-    # visualize some samples
-    for batch in data_loader:
-        # batch has three keys:
-        # key 1: batch['image']         size: batch_size x 3(C) x 192(W) x 192(H)
-        # key 2: batch['heat_map_gn']   size: batch_size x 21(kps) x 64(W) x 64(H)
-        # each of the 21 heat maps is of size 64(W) x 64(H)
-        # key 3: batch[2d_kp_anno']     size: batch_size x 2 x 21(kps)
-        # The first row contains u-axis coordinates and the second row contains v-axis values
-
-        for i in range(0, batch['heat_map_gn'].shape[1], 6):
-            fig = plt.figure(1)
-            ax1 = fig.add_subplot('121')
-            ax2 = fig.add_subplot('122')
-            img = toPIL(batch['image'][0])
-            ax1.imshow(img)
-            ax2.imshow(toPIL(batch['heat_map_gn'][0][i]))
-            print(torch.max(batch['heat_map_gn'][0][i]))
-            print(batch['heat_map_gn'][0][i])
-            plt.show()
 
 
 def evaluate(val_data_loader, model):
@@ -264,6 +73,19 @@ def main():
 
     torch.cuda.empty_cache()
 
+    logger = logging.getLogger(name='Training log')
+    logger.setLevel(logging.INFO)
+    # 第二步，创建一个handler，用于写入日志文件
+    rq = time.strftime('%Y%m%d%H%M', time.localtime(time.time()))
+    logfile = config.root_dir + config.model_name + '_' + rq + '.log'
+    fh = logging.FileHandler(logfile, mode='w')
+    fh.setLevel(logging.DEBUG)  # 输出到file的log等级的开关
+    # 第三步，定义handler的输出格式
+    formatter = logging.Formatter("%(asctime)s - %(filename)s - %(levelname)s: %(message)s")
+    fh.setFormatter(formatter)
+    # 第四步，将logger添加到hand
+    logger.addHandler(fh)
+
     # Read datasets
     print("Reading dataset...")
     training_set = hm_dataset(config.root_dir, 'training', input_resize=config.input_size)
@@ -276,12 +98,12 @@ def main():
     )
     val_loader = DataLoader(
         val_set,
-        batch_size=config.batch_size,  # 每批样本个数
-        shuffle=config.is_shuffle,  # 是否打乱顺序
+        batch_size=1,  # 每批样本个数
     )
     config.num_train_samples = len(training_set)
     config.num_val_samples = len(val_set)
-    config.num_iters = int(len(training_set) / config.batch_size)
+    config.num_train_iters = int(len(training_set) / config.batch_size)
+    
     print("Found {} training samples and {} validation samples".format(len(training_set), len(val_set)))
 
     # instantiate a model
@@ -296,7 +118,7 @@ def main():
     # recorder.writer.add_graph(model)
     model.to(device)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
+    optimizer = torch.optim.RMSprop(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
 
     resume = False
     start_epoch = 0
@@ -306,7 +128,6 @@ def main():
         recorder.val_hm_loss_min = ckpt["val_hm_loss_min"]
         recorder.val_kps_loss_min = ckpt["val_kps_loss_min"]
         recorder.val_total_loss_min = ckpt["val_total_loss_min"]
-        recorder.val_PCK_max = ckpt["val_PCK_max"]
         model.load_state_dict(ckpt["state_dict"])
         optimizer.load_state_dict(ckpt["optimizer"])
         lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=config.step_size, gamma=config.gamma,
@@ -322,32 +143,55 @@ def main():
     print(f'{total_trainable_params:,} training parameters.')
 
     print("-------------------------Training starts--------------------------")
+    start_time = time.time()
     for epoch in range(start_epoch, config.num_epochs):
+        recorder.cur_epoch += 1
         epoch_str = "Epoch %d" % (epoch + 1)
         print(epoch_str, "Learning rate: %f   Time: " % (optimizer.param_groups[0]['lr']), end='')
         print(time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()))
-        start_time = time.time()
-        for i, batch in enumerate(train_loader):
-            break
-            # batch has three keys:
-            #     # key 1: batch['image']         size: B x 3(C) x 192(W) x 192(H)
-            #     # key 2: batch['heat_map_gn']   size: B x 21(kps) x 64(W) x 64(H)
-            #     # each of the 21 heat maps is of size 64(W) x 64(H)
-            #     # key 3: batch['2d_kp_anno']     size: B x 21(kps) x 2(uv)
-            #     # The first row contains u-axis coordinates and the second row contains v-axis values
+        epoch_start_time = time.time()
 
-            model.train()
+        model.train()
+        for i, batch in enumerate(train_loader):
+            # batch has three keys:
+            #     # key 1: batch['image']         size: B x 3(C) x 256(W) x 256(H)
+            #     # key 2: batch['heat_map_gn']   normalized 2D heat maps (each sums to 1) of size: B x 21(kps) x 64(W) x 64(H)
+            #     # each of the 21 heat maps is of size 64(W) x 64(H)
+            #     # key 3: batch['2d_kp_anno']     size: B x 21(kps) x 2(uv) [u (rightwards),v (downwards)]
+            #     # The first row contains u-axis coordinates and the second row contains v-axis values
             input_img = batch['image'].to(device)
-            hm_groundtruth = batch['heat_map_gn'].to(device).float()
-            # the output has two items. 1. tmp_outputs: contains outputs from each stage
-            # 2. norm_x
-            output = model(input_img)
-            loss = recorder.process_training_output(hm_pred=output[0],
-                                                    hm_gn=hm_groundtruth,
+            output = model(input_img)  # the output has two items. 1. tmp_outputs: contains outputs from each stage; 2. norm_x
+
+            hm_loss, kps_loss, total_loss = recorder.process_training_output(hm_pred=output[0],
+                                                    hm_gn=batch['heat_map_gn'].to(device).float(),
                                                     kps_gn=batch['2d_kp_anno'])
 
+            cur_iter_num = recorder.cur_iter_num + 1
+            recorder.cur_iter_num += 1
+            if cur_iter_num % config.record_period == 0:
+                msg = 'Epoch: [{}][{}/{}]\t' \
+                    'Completion Time: ' + time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()) + '\t' \
+                    'Heat Map Loss ({:.2e}): {:.4f} \t' \
+                    '2D Pose Loss ({:.2e}): {:.4f} \t'  \
+                    'Total Loss: {:.4f} \t'.format(
+                        epoch+1,
+                        cur_iter_num % config.num_train_iters,
+                        config.num_train_iters,
+                        hm_loss.item(),
+                        kps_loss.item(),
+                        total_loss.item())
+
+                logger.info(msg)
+                recorder.train_hm_loss.append(hm_loss.item())
+                recorder.train_kps_loss.append(kps_loss.item())
+                recorder.train_total_loss.append(total_loss.item())
+
+                recorder.writer.add_scalar('HM_Loss/Training', hm_loss.item(), cur_iter_num)
+                recorder.writer.add_scalar('Pose2D_Loss/Training', kps_loss.item(), cur_iter_num)
+                recorder.writer.add_scalar('Total_Loss/Training', total_loss.item(), cur_iter_num)
+
             optimizer.zero_grad()
-            loss.backward()
+            total_loss.backward()
             optimizer.step()
 
             del input_img
@@ -362,8 +206,6 @@ def main():
               "2D pose loss: {:.4f} (The best: {:.4f})".format(recorder.val_kps_loss[-1], recorder.val_kps_loss_min))
         print(epoch_str,
               "Total loss: {:.4f} (The best: {:.4f})".format(recorder.val_total_loss[-1], recorder.val_total_loss_min))
-        print(epoch_str,
-              "PCK: {:.4f} (The best: {:.4f})".format(recorder.val_avg_PCK[-1], recorder.val_PCK_max))
 
         print("Saving model checkpoint...")
         save_checkpoint({
@@ -374,17 +216,16 @@ def main():
             "val_pose2d_loss": recorder.val_kps_loss[-1],
             "val_hm_loss": recorder.val_hm_loss[-1],
             "val_total_loss": recorder.val_total_loss[-1],
-            "PCK": recorder.val_avg_PCK[-1],
             "val_hm_loss_min": recorder.val_hm_loss_min,
             "val_kps_loss_min": recorder.val_kps_loss_min,
-            "val_total_loss_min": recorder.val_total_loss_min,
-            "val_PCK_max": recorder.val_PCK_max
+            "val_total_loss_min": recorder.val_total_loss_min
         }, is_best_HM_loss, is_best_pose2d_loss, is_best_total_loss)
 
         lr_scheduler.step()
 
-        print("Epoch %d spent %d seconds \n" % (epoch + 1, int(time.time() - start_time)))
+        print("Epoch %d spent %d seconds \n" % (epoch + 1, int(time.time() - epoch_start_time)))
 
+    print("{} epochs spent {:.2f} hours".format(config.num_epochs, (time.time()-start_time)/3600))
     recorder.close()
 
 
